@@ -25,6 +25,12 @@ class ResultCode(IntEnum):
             return cls.NOERROR
 
 
+class ReprMixin:
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}\n" for k, v in vars(self).items())
+        return f"{type(self).__name__}({fields})"
+
+
 class BytePacketBuffer:
     """
     A buffer for handling binary DNS packets with a fixed size of 512 bytes,
@@ -133,7 +139,7 @@ class BytePacketBuffer:
         return ".".join(out_parts)
 
 
-class DnsHeader:
+class DnsHeader(ReprMixin):
     """
     Represents the 12-byte DNS header at the beginning of every DNS packet.
     """
@@ -211,7 +217,7 @@ class QueryType(IntEnum):
         except ValueError:
             return cls.UNKNOWN
 
-class DnsQuestion:
+class DnsQuestion(ReprMixin):
     def __init__(self, name: str = "", qtype: QueryType = QueryType.A):
         self.name: str = name
         self.qtype: QueryType = qtype
@@ -228,3 +234,133 @@ class DnsQuestion:
 
         return question
 
+
+class DnsRecord(ReprMixin):
+    """Base class for parsed DNS records (Answers, Authorities, Additional records)."""
+    
+    @classmethod
+    def read(cls, buffer: BytePacketBuffer) -> "DnsRecord":
+        """
+        Parses a DNS record from the buffer based on its type 
+        (e.g., standard 'A' record or an unknown record).
+        """
+        domain = buffer.read_qname()
+
+        qtype_num = buffer.read_u16()
+        qtype = QueryType.from_num(qtype_num)
+        
+        _ = buffer.read_u16()
+        ttl = buffer.read_u32()
+        data_len = buffer.read_u16()
+
+        if qtype == QueryType.A:
+            raw_addr = buffer.read_u32()
+            
+            # Convert 32-bit raw integer into a readable IP address string (e.g., '192.168.1.1')
+            addr = str(ipaddress.ip_address(raw_addr))
+            
+            return DnsRecordA(domain=domain, addr=addr, ttl=ttl)
+        
+        else:
+            # Skip past the payload data safely using the data_len length
+            buffer.step(data_len)
+            
+            return DnsRecordUnknown(
+                domain=domain, 
+                qtype=qtype_num, 
+                data_len=data_len, 
+                ttl=ttl
+            )
+
+
+class DnsRecordA(DnsRecord):
+    """Represents an IPv4 Address record (Type 1)."""
+    def __init__(self, domain: str, addr: str, ttl: int):
+        self.domain = domain
+        self.addr = addr
+        self.ttl = ttl
+
+    def __repr__(self):
+        return f"DnsRecord.A(domain={self.domain}, addr={self.addr}, ttl={self.ttl})"
+
+
+class DnsRecordUnknown(DnsRecord):
+    """Represents any unhandled/unknown DNS record type."""
+    def __init__(self, domain: str, qtype: int, data_len: int, ttl: int):
+        self.domain = domain
+        self.qtype = qtype
+        self.data_len = data_len
+        self.ttl = ttl
+
+    def __repr__(self):
+        return f"DnsRecord.UNKNOWN(domain={self.domain}, qtype={self.qtype}, data_len={self.data_len}, ttl={self.ttl})"
+
+
+class DnsPacket:
+    """
+    Represents a complete DNS packet, containing a header, 
+    questions, answers, authorities, and resource records.
+    """
+    def __init__(self):
+        self.header = DnsHeader()
+        self.questions = []
+        self.answers = []
+        self.authorities = []
+        self.resources = []
+
+    @classmethod
+    def from_buffer(cls, buffer: BytePacketBuffer) -> "DnsPacket":
+        """
+        Parses a complete DnsPacket from the raw binary buffer,
+        mirroring the Rust implementation.
+        """
+        result = cls()
+        result.header = DnsHeader.read(buffer)
+
+        for _ in range(result.header.questions):
+            # Creates a blank question with a dummy default query type (A, unknown)
+            question = DnsQuestion.read(buffer)
+            result.questions.append(question)
+
+        for _ in range(result.header.answers):
+            rec = DnsRecord.read(buffer)
+            result.answers.append(rec)
+
+        for _ in range(result.header.authoritative_entries):
+            rec = DnsRecord.read(buffer)
+            result.authorities.append(rec)
+
+        for _ in range(result.header.resource_entries):
+            rec = DnsRecord.read(buffer)
+            result.resources.append(rec)
+
+        return result
+
+
+def main():
+    try:
+        with open("response_packet.txt", "rb") as f:
+                raw_data = f.read()
+    except FileNotFoundError:
+        print("Error: response_packet.txt not found. Generate it by running tester.py first.")
+        return
+
+    buffer = BytePacketBuffer()
+    buffer.buf[:len(raw_data)] = raw_data  # Copy bytes into the buffer array
+    buffer.pos = 0                        
+
+    packet = DnsPacket.from_buffer(buffer)
+    print("Parsed DNS Packet:")
+    print(f"{packet.header!r}")
+
+    for q in packet.questions:
+        print(f"{q!r}")
+    for rec in packet.answers:
+        print(f"{rec!r}")
+    for rec in packet.authorities:
+        print(f"{rec!r}")
+    for rec in packet.resources:
+        print(f"{rec!r}")
+
+if __name__ == "__main__":
+    main()
