@@ -1,5 +1,6 @@
 from enum import IntEnum
 import ipaddress
+import socket
 
 
 class BufferError(Exception):
@@ -86,10 +87,33 @@ class BytePacketBuffer:
             | self.read()
         )
 
+    def write(self, val: int) -> None:
+        """Write a single byte and move the position one step forward."""
+        if self.pos >= 512:
+            raise BufferError("End of buffer")
+        self.buf[self.pos] = val
+        self.pos += 1
+
+    def write_u8(self, val: int) -> None:
+        """Write an 8-bit unsigned integer (1 byte)."""
+        self.write(val)
+
+    def write_u16(self, val: int) -> None:
+        """Write a 16-bit unsigned integer (2 bytes, big-endian)."""
+        self.write((val >> 8) & 0xFF)
+        self.write(val & 0xFF)
+
+    def write_u32(self, val: int) -> None:
+        """Write a 32-bit unsigned integer (4 bytes, big-endian)."""
+        self.write((val >> 24) & 0xFF)
+        self.write((val >> 16) & 0xFF)
+        self.write((val >> 8) & 0xFF)
+        self.write(val & 0xFF)
+
     def read_qname(self) -> str:
         """
         Read a domain name (qname) handling DNS label compression (jumps).
-        Returns the parsed domain name as a lowercase string (e.g., 'www.google.com').
+        Returns the parsed domain name as a lowercase string.
         """
         pos = self.get_pos()
         jumped = False
@@ -137,6 +161,22 @@ class BytePacketBuffer:
             self.seek(pos)
 
         return ".".join(out_parts)
+
+    def write_qname(self, qname: str) -> None:
+        """
+        Write a domain name into the buffer in DNS label format.
+        'google.com' becomes [6] g o o g l e [3] c o m [0]
+        """
+        for label in qname.split('.'):
+            len_val = len(label)
+            if len_val > 0x3F:  # 63 characters max per label
+                raise BufferError("Single label exceeds 63 characters of length")
+
+            self.write_u8(len_val)
+            
+            for b in label.encode("ascii"):
+                self.write_u8(b)
+        self.write_u8(0)
 
 
 class DnsHeader(ReprMixin):
@@ -195,6 +235,35 @@ class DnsHeader(ReprMixin):
 
         return header
 
+    def write(self, buffer: BytePacketBuffer) -> None:
+        """
+        Serializes the DnsHeader and writes it into the given BytePacketBuffer,
+        mirroring the Rust implementation.
+        """
+        buffer.write_u16(self.id)
+
+        first_flag_byte = (
+            (int(self.recursion_desired))
+            | (int(self.truncated_message) << 1)
+            | (int(self.authoritative_answer) << 2)
+            | ((self.opcode & 0x0F) << 3)
+            | (int(self.response) << 7)
+        )
+        buffer.write_u8(first_flag_byte)
+
+        second_flag_byte = (
+            (int(self.rescode) & 0x0F)
+            | (int(self.checking_disabled) << 4)
+            | (int(self.authed_data) << 5)
+            | (int(self.z) << 6)
+            | (int(self.recursion_available) << 7)
+        )
+        buffer.write_u8(second_flag_byte)
+        buffer.write_u16(self.questions)
+        buffer.write_u16(self.answers)
+        buffer.write_u16(self.authoritative_entries)
+        buffer.write_u16(self.resource_entries)
+
 
 class QueryType(IntEnum):
     """Represents a DNS query type."""
@@ -234,6 +303,20 @@ class DnsQuestion(ReprMixin):
 
         return question
 
+    def write(self, buffer: BytePacketBuffer) -> None:
+        """
+        Serializes the DnsQuestion and writes it into the given BytePacketBuffer,
+        mirroring the Rust implementation.
+        """
+        buffer.write_qname(self.name)
+
+        # qtype is an IntEnum, we can use int(self.qtype) directly,
+        typenum = int(self.qtype)
+        buffer.write_u16(typenum)
+
+        #the query class (1 for Internet, standard for almost all DNS queries)
+        buffer.write_u16(1)
+
 
 class DnsRecord(ReprMixin):
     """Base class for parsed DNS records (Answers, Authorities, Additional records)."""
@@ -272,6 +355,30 @@ class DnsRecord(ReprMixin):
                 ttl=ttl
             )
 
+    def write(self, buffer: BytePacketBuffer) -> int:
+        """
+        Serializes a DNS record into the buffer and returns the number of bytes written.
+        """
+        start_pos = buffer.get_pos()
+        
+        # we use polymorphism/isinstance or handle it per subclass.
+        if isinstance(self, DnsRecordA):
+            buffer.write_qname(self.domain)
+            buffer.write_u16(int(QueryType.A))  # Type A = 1
+            buffer.write_u16(1)                 # Class IN = 1
+            buffer.write_u32(self.ttl)
+            buffer.write_u16(4)                 # IPv4 address length is always 4 bytes
+
+            # Convert the string IP into raw 4 octet bytes
+            ip_obj = ipaddress.ip_address(self.addr)
+            for octet in ip_obj.packed:
+                buffer.write_u8(octet)
+                
+        elif isinstance(self, DnsRecordUnknown):
+            print(f"Skipping record: {self!r}")
+            
+        return buffer.get_pos() - start_pos
+
 
 class DnsRecordA(DnsRecord):
     """Represents an IPv4 Address record (Type 1)."""
@@ -309,6 +416,11 @@ class DnsPacket:
         self.resources = []
 
     @classmethod
+    def new(cls) -> "DnsPacket":
+        """Creates an empty DnsPacket, mirroring Rust's DnsPacket::new()"""
+        return cls()
+
+    @classmethod
     def from_buffer(cls, buffer: BytePacketBuffer) -> "DnsPacket":
         """
         Parses a complete DnsPacket from the raw binary buffer,
@@ -336,31 +448,61 @@ class DnsPacket:
 
         return result
 
+    def write(self, buffer: BytePacketBuffer) -> None:
+        """
+        Serializes the complete DnsPacket  and writes it into the buffer.
+        """
+        self.header.questions = len(self.questions)
+        self.header.answers = len(self.answers)
+        self.header.authoritative_entries = len(self.authorities)
+        self.header.resource_entries = len(self.resources)
+        self.header.write(buffer)
+        for question in self.questions:
+            question.write(buffer)
+        for rec in self.answers:
+            rec.write(buffer)
+        for rec in self.authorities:
+            rec.write(buffer)
+        for rec in self.resources:
+            rec.write(buffer)
+
 
 def main():
-    try:
-        with open("response_packet.txt", "rb") as f:
-                raw_data = f.read()
-    except FileNotFoundError:
-        print("Error: response_packet.txt not found. Generate it by running tester.py first.")
-        return
+    qname = "google.com"
+    qtype = QueryType.A
 
-    buffer = BytePacketBuffer()
-    buffer.buf[:len(raw_data)] = raw_data  # Copy bytes into the buffer array
-    buffer.pos = 0                        
+    server = ("8.8.8.8", 53)
 
-    packet = DnsPacket.from_buffer(buffer)
-    print("Parsed DNS Packet:")
-    print(f"{packet.header!r}")
+    #socket.AF_INET and socket.SOCK_DGRAM handle UDP
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 43210))
+    packet = DnsPacket.new()
+    packet.header.id = 6666
+    packet.header.recursion_desired = True
+    
+    packet.questions.append(DnsQuestion(qname, qtype))
+    req_buffer = BytePacketBuffer()
+    packet.write(req_buffer)
 
-    for q in packet.questions:
+    #sliced `req_buffer.buf` upto `req_buffer.pos` so we only send the actual written bytes
+    sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
+    res_buffer = BytePacketBuffer()
+    
+    raw_data, _ = sock.recvfrom(512)
+    res_buffer.buf[:len(raw_data)] = raw_data
+    res_buffer.pos = 0
+    res_packet = DnsPacket.from_buffer(res_buffer)
+
+    print(f"{res_packet.header!r}\n")
+    for q in res_packet.questions:
         print(f"{q!r}")
-    for rec in packet.answers:
+    for rec in res_packet.answers:
         print(f"{rec!r}")
-    for rec in packet.authorities:
+    for rec in res_packet.authorities:
         print(f"{rec!r}")
-    for rec in packet.resources:
+    for rec in res_packet.resources:
         print(f"{rec!r}")
+
 
 if __name__ == "__main__":
     main()
