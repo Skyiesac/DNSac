@@ -1,7 +1,8 @@
 from enum import IntEnum
 import ipaddress
 import socket
-
+import random
+import sys
 
 class BufferError(Exception):
     """Custom exception raised when reading or seeking out of buffer bounds."""
@@ -248,8 +249,7 @@ class DnsHeader(ReprMixin):
 
     def write(self, buffer: BytePacketBuffer) -> None:
         """
-        Serializes the DnsHeader and writes it into the given BytePacketBuffer,
-        mirroring the Rust implementation.
+        Serializes the DnsHeader and writes it into the given BytePacketBuffer.
         """
         buffer.write_u16(self.id)
 
@@ -316,8 +316,7 @@ class DnsQuestion(ReprMixin):
 
     def write(self, buffer: BytePacketBuffer) -> None:
         """
-        Serializes the DnsQuestion and writes it into the given BytePacketBuffer,
-        mirroring the Rust implementation.
+        Serializes the DnsQuestion and writes it into the given BytePacketBuffer.
         """
         buffer.write_qname(self.name)
 
@@ -507,14 +506,13 @@ class DnsPacket:
 
     @classmethod
     def new(cls) -> "DnsPacket":
-        """Creates an empty DnsPacket, mirroring Rust's DnsPacket::new()"""
+        """Creates an empty DnsPacket."""
         return cls()
 
     @classmethod
     def from_buffer(cls, buffer: BytePacketBuffer) -> "DnsPacket":
         """
-        Parses a complete DnsPacket from the raw binary buffer,
-        mirroring the Rust implementation.
+        Parses a complete DnsPacket from the raw binary buffer.
         """
         result = cls()
         result.header = DnsHeader.read(buffer)
@@ -556,11 +554,54 @@ class DnsPacket:
         for rec in self.resources:
             rec.write(buffer)
 
+    def get_random_a(self) -> str | None:
+        """
+        Picks an available A record (IPv4 address) from the answers section.
+        """
+        a_records = [
+            record.addr for record in self.answers 
+            if isinstance(record, DnsRecordA)
+        ]
+        if not a_records:
+            return None
+        # In Python, we can just return one (or pick randomly if multiple exist)
+        return random.choice(a_records)
 
-def lookup(qname: str, qtype: QueryType) -> DnsPacket:
+    def _get_ns(self, qname: str):
+        """
+        Helper generator yielding (domain, host) tuples from the authorities section
+        that are authoritative for the given query name.
+        """
+        for record in self.authorities:
+            if isinstance(record, DnsRecordNS):
+                if qname.endswith(record.domain):
+                    yield (record.domain, record.host)
+
+    def get_resolved_ns(self, qname: str) -> str | None:
+        """
+        Looks for a name server in the authorities section whose matching IP address 
+        is already bundled as a Glue record in the additional/resource section.
+        """
+        for _, host in self._get_ns(qname):
+            for record in self.resources:
+                if isinstance(record, DnsRecordA) and record.domain == host:
+                    return record.addr
+        return None
+
+    def get_unresolved_ns(self, qname: str) -> str | None:
+        """
+        Returns the hostname of an appropriate name server from the authorities section 
+        when no bundled Glue record (A record) is available in the additional section.
+        """
+        for _, host in self._get_ns(qname):
+            return host
+        return None
+
+
+def lookup(qname: str, qtype: QueryType, server: tuple[str, int]) -> DnsPacket:
     """
     Takes a domain name and query type, forwards it to Google's public DNS (8.8.8.8),
-    and returns the parsed DnsPacket response, mirroring the Rust implementation.
+    and returns the parsed DnsPacket response.
     """
     server = ("8.8.8.8", 53)
 
@@ -584,10 +625,47 @@ def lookup(qname: str, qtype: QueryType) -> DnsPacket:
     res_buffer.pos = 0
     return DnsPacket.from_buffer(res_buffer)
 
+def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
+    """
+    Performs an iterative/recursive DNS lookup starting from the root servers,
+    traversing TLDs and authoritative name servers until it resolves the query.
+    """
+    # For now, always start with a root server (a.root-servers.net -> 198.41.0.4)
+    ns = "198.41.0.4"
+
+    while True:
+        print(f"Attempting lookup of {qtype.name} {qname} with ns {ns}")
+
+        server = (ns, 53)
+        response = lookup(qname, qtype, server)
+
+        if response.answers and response.header.rescode == ResultCode.NOERROR:
+            return response
+        if response.header.rescode == ResultCode.NXDOMAIN:
+            return response
+        new_ns = response.get_resolved_ns(qname)
+        if new_ns:
+            ns = new_ns
+            continue
+
+        new_ns_name = response.get_unresolved_ns(qname)
+        if not new_ns_name:
+            return response
+
+        #start another recursive lookup to find the IP of the name server
+        recursive_response = recursive_lookup(new_ns_name, QueryType.A)
+
+        # Pick a random IP from the result, and restart the loop
+        random_ip = recursive_response.get_random_a()
+        if random_ip:
+            ns = random_ip
+        else:
+            return response
+
 def handle_query(sock: socket.socket) -> None:
     """
-    Handles a single incoming DNS query packet, forwards it upstream via lookup(),
-    packs the response, and sends it back to the client, mirroring the Rust implementation.
+    Handles a single incoming DNS query packet, uses recursive_lookup() to resolve it 
+    from the root servers up, packs the response, and sends it back to the client.
     """
     req_buffer = BytePacketBuffer()
     raw_data, src = sock.recvfrom(512)
@@ -603,12 +681,11 @@ def handle_query(sock: socket.socket) -> None:
     packet.header.response = True
 
     if request.questions:
-        question = request.questions.pop(0)
+        question = request.questions[0]
         print(f"Received query: {question!r}")
 
         try:
-            # Forward the query upstream using our lookup() function
-            result = lookup(question.name, question.qtype)
+            result = recursive_lookup(question.name, question.qtype)
             packet.questions.append(question)
             packet.header.rescode = result.header.rescode
 
@@ -621,7 +698,8 @@ def handle_query(sock: socket.socket) -> None:
             for rec in result.resources:
                 print(f"Resource: {rec!r}")
                 packet.resources.append(rec)
-        except Exception:
+        except Exception as e:
+            print(f"Lookup error: {e}", file=sys.stderr)
             packet.header.rescode = ResultCode.SERVFAIL
     else:
         packet.header.rescode = ResultCode.FORMERR
