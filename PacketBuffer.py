@@ -557,41 +557,96 @@ class DnsPacket:
             rec.write(buffer)
 
 
-def main():
-    qname = "www.yahoo.com"
-    qtype = QueryType.A
-
+def lookup(qname: str, qtype: QueryType) -> DnsPacket:
+    """
+    Takes a domain name and query type, forwards it to Google's public DNS (8.8.8.8),
+    and returns the parsed DnsPacket response, mirroring the Rust implementation.
+    """
     server = ("8.8.8.8", 53)
 
-    #socket.AF_INET and socket.SOCK_DGRAM handle UDP
+    # Bind a UDP socket to an arbitrary port for outgoing queries
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", 43210))
+
     packet = DnsPacket.new()
     packet.header.id = 6666
     packet.header.recursion_desired = True
-    
     packet.questions.append(DnsQuestion(qname, qtype))
     req_buffer = BytePacketBuffer()
     packet.write(req_buffer)
-
-    #sliced `req_buffer.buf` upto `req_buffer.pos` so we only send the actual written bytes
     sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
+
+    #response
     res_buffer = BytePacketBuffer()
-    
     raw_data, _ = sock.recvfrom(512)
+    
     res_buffer.buf[:len(raw_data)] = raw_data
     res_buffer.pos = 0
-    res_packet = DnsPacket.from_buffer(res_buffer)
+    return DnsPacket.from_buffer(res_buffer)
 
-    print(f"{res_packet.header!r}\n")
-    for q in res_packet.questions:
-        print(f"{q!r}")
-    for rec in res_packet.answers:
-        print(f"{rec!r}")
-    for rec in res_packet.authorities:
-        print(f"{rec!r}")
-    for rec in res_packet.resources:
-        print(f"{rec!r}")
+def handle_query(sock: socket.socket) -> None:
+    """
+    Handles a single incoming DNS query packet, forwards it upstream via lookup(),
+    packs the response, and sends it back to the client, mirroring the Rust implementation.
+    """
+    req_buffer = BytePacketBuffer()
+    raw_data, src = sock.recvfrom(512)
+    
+    req_buffer.buf[:len(raw_data)] = raw_data
+    req_buffer.pos = 0
+
+    request = DnsPacket.from_buffer(req_buffer)
+    packet = DnsPacket.new()
+    packet.header.id = request.header.id
+    packet.header.recursion_desired = True
+    packet.header.recursion_available = True
+    packet.header.response = True
+
+    if request.questions:
+        question = request.questions.pop(0)
+        print(f"Received query: {question!r}")
+
+        try:
+            # Forward the query upstream using our lookup() function
+            result = lookup(question.name, question.qtype)
+            packet.questions.append(question)
+            packet.header.rescode = result.header.rescode
+
+            for rec in result.answers:
+                print(f"Answer: {rec!r}")
+                packet.answers.append(rec)
+            for rec in result.authorities:
+                print(f"Authority: {rec!r}")
+                packet.authorities.append(rec)
+            for rec in result.resources:
+                print(f"Resource: {rec!r}")
+                packet.resources.append(rec)
+        except Exception:
+            packet.header.rescode = ResultCode.SERVFAIL
+    else:
+        packet.header.rescode = ResultCode.FORMERR
+
+    res_buffer = BytePacketBuffer()
+    packet.write(res_buffer)
+    
+    response_data = bytes(res_buffer.buf[:res_buffer.pos])
+    sock.sendto(response_data, src)
+
+
+def main() -> None:
+    """
+    Binds the local DNS server to port 2053 and runs an infinite loop 
+    servicing incoming requests sequentially.
+    """
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_sock.bind(("0.0.0.0", 2053))
+    print("DNS Server running on port 2053...")
+
+    while True:
+        try:
+            handle_query(server_sock)
+        except Exception as e:
+            print(f"An error occurred: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
