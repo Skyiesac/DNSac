@@ -110,6 +110,17 @@ class BytePacketBuffer:
         self.write((val >> 8) & 0xFF)
         self.write(val & 0xFF)
 
+    def set(self, pos: int, val: int) -> None:
+        """Set a single byte at a specific position without changing the buffer's read/write position."""
+        if pos >= 512:
+            raise BufferError("Position out of buffer bounds")
+        self.buf[pos] = val
+
+    def set_u16(self, pos: int, val: int) -> None:
+        """Set a 16-bit unsigned integer (2 bytes, big-endian) at a specific position."""
+        self.set(pos, (val >> 8) & 0xFF)
+        self.set(pos + 1, val & 0xFF)
+
     def read_qname(self) -> str:
         """
         Read a domain name (qname) handling DNS label compression (jumps).
@@ -317,22 +328,21 @@ class DnsQuestion(ReprMixin):
         #the query class (1 for Internet, standard for almost all DNS queries)
         buffer.write_u16(1)
 
-
-class DnsRecord(ReprMixin):
+class DnsRecord:
     """Base class for parsed DNS records (Answers, Authorities, Additional records)."""
     
     @classmethod
     def read(cls, buffer: BytePacketBuffer) -> "DnsRecord":
         """
         Parses a DNS record from the buffer based on its type 
-        (e.g., standard 'A' record or an unknown record).
+        (A, NS, CNAME, MX, AAAA, or UNKNOWN).
         """
         domain = buffer.read_qname()
 
         qtype_num = buffer.read_u16()
         qtype = QueryType.from_num(qtype_num)
         
-        _ = buffer.read_u16()
+        _ = buffer.read_u16()  # Class (usually 1 for IN)
         ttl = buffer.read_u32()
         data_len = buffer.read_u16()
 
@@ -341,13 +351,30 @@ class DnsRecord(ReprMixin):
             
             # Convert 32-bit raw integer into a readable IP address string (e.g., '192.168.1.1')
             addr = str(ipaddress.ip_address(raw_addr))
-            
             return DnsRecordA(domain=domain, addr=addr, ttl=ttl)
+
+        elif qtype == QueryType.NS:
+            host = buffer.read_qname()
+            return DnsRecordNS(domain=domain, host=host, ttl=ttl)
+
+        elif qtype == QueryType.CNAME:
+            host = buffer.read_qname()
+            return DnsRecordCNAME(domain=domain, host=host, ttl=ttl)
+
+        elif qtype == QueryType.MX:
+            priority = buffer.read_u16()
+            host = buffer.read_qname()
+            return DnsRecordMX(domain=domain, priority=priority, host=host, ttl=ttl)
+
+        elif qtype == QueryType.AAAA:
+            # Read 16 bytes for IPv6 address
+            raw_bytes = buffer.get_range(buffer.get_pos(), 16)
+            buffer.step(16)
+            addr = str(ipaddress.ip_address(raw_bytes))
+            return DnsRecordAAAA(domain=domain, addr=addr, ttl=ttl)
         
         else:
-            # Skip past the payload data safely using the data_len length
             buffer.step(data_len)
-            
             return DnsRecordUnknown(
                 domain=domain, 
                 qtype=qtype_num, 
@@ -357,31 +384,65 @@ class DnsRecord(ReprMixin):
 
     def write(self, buffer: BytePacketBuffer) -> int:
         """
-        Serializes a DNS record into the buffer and returns the number of bytes written.
+        Serializes a DNS record into the buffer and returns the total number of bytes written.
         """
         start_pos = buffer.get_pos()
         
-        # we use polymorphism/isinstance or handle it per subclass.
-        if isinstance(self, DnsRecordA):
+        def write_header(qtype: QueryType):
             buffer.write_qname(self.domain)
-            buffer.write_u16(int(QueryType.A))  # Type A = 1
-            buffer.write_u16(1)                 # Class IN = 1
+            buffer.write_u16(int(qtype))
+            buffer.write_u16(1)  # Class IN
             buffer.write_u32(self.ttl)
-            buffer.write_u16(4)                 # IPv4 address length is always 4 bytes
 
-            # Convert the string IP into raw 4 octet bytes
-            ip_obj = ipaddress.ip_address(self.addr)
-            for octet in ip_obj.packed:
+        if isinstance(self, DnsRecordA):
+            write_header(QueryType.A)
+            buffer.write_u16(4)
+            for octet in ipaddress.ip_address(self.addr).packed:
                 buffer.write_u8(octet)
-                
+
+        elif isinstance(self, (DnsRecordNS, DnsRecordCNAME)):
+            qtype = QueryType.NS if isinstance(self, DnsRecordNS) else QueryType.CNAME
+            write_header(qtype)
+            
+            # Write variable length payload with length-patching
+            pos = buffer.get_pos()
+            buffer.write_u16(0)
+            buffer.write_qname(self.host)
+            buffer.set_u16(pos, buffer.get_pos() - (pos + 2))
+
+        elif isinstance(self, DnsRecordMX):
+            write_header(QueryType.MX)
+            
+            pos = buffer.get_pos()
+            buffer.write_u16(0)
+            buffer.write_u16(self.priority)
+            buffer.write_qname(self.host)
+            buffer.set_u16(pos, buffer.get_pos() - (pos + 2))
+
+        elif isinstance(self, DnsRecordAAAA):
+            write_header(QueryType.AAAA)
+            buffer.write_u16(16)
+            ip_obj = ipaddress.ip_address(self.addr)
+            for i in range(0, 16, 2):
+                buffer.write_u16((ip_obj.packed[i] << 8) | ip_obj.packed[i + 1])
+
         elif isinstance(self, DnsRecordUnknown):
             print(f"Skipping record: {self!r}")
             
         return buffer.get_pos() - start_pos
 
+class DnsRecordUnknown(DnsRecord):
+    def __init__(self, domain: str, qtype: int, data_len: int, ttl: int):
+        self.domain = domain
+        self.qtype = qtype
+        self.data_len = data_len
+        self.ttl = ttl
+
+    def __repr__(self):
+        return f"DnsRecord.UNKNOWN(domain={self.domain}, qtype={self.qtype}, data_len={self.data_len}, ttl={self.ttl})"
+
 
 class DnsRecordA(DnsRecord):
-    """Represents an IPv4 Address record (Type 1)."""
     def __init__(self, domain: str, addr: str, ttl: int):
         self.domain = domain
         self.addr = addr
@@ -391,16 +452,45 @@ class DnsRecordA(DnsRecord):
         return f"DnsRecord.A(domain={self.domain}, addr={self.addr}, ttl={self.ttl})"
 
 
-class DnsRecordUnknown(DnsRecord):
-    """Represents any unhandled/unknown DNS record type."""
-    def __init__(self, domain: str, qtype: int, data_len: int, ttl: int):
+class DnsRecordNS(DnsRecord):
+    def __init__(self, domain: str, host: str, ttl: int):
         self.domain = domain
-        self.qtype = qtype
-        self.data_len = data_len
+        self.host = host
         self.ttl = ttl
 
     def __repr__(self):
-        return f"DnsRecord.UNKNOWN(domain={self.domain}, qtype={self.qtype}, data_len={self.data_len}, ttl={self.ttl})"
+        return f"DnsRecord.NS(domain={self.domain}, host={self.host}, ttl={self.ttl})"
+
+
+class DnsRecordCNAME(DnsRecord):
+    def __init__(self, domain: str, host: str, ttl: int):
+        self.domain = domain
+        self.host = host
+        self.ttl = ttl
+
+    def __repr__(self):
+        return f"DnsRecord.CNAME(domain={self.domain}, host={self.host}, ttl={self.ttl})"
+
+
+class DnsRecordMX(DnsRecord):
+    def __init__(self, domain: str, priority: int, host: str, ttl: int):
+        self.domain = domain
+        self.priority = priority
+        self.host = host
+        self.ttl = ttl
+
+    def __repr__(self):
+        return f"DnsRecord.MX(domain={self.domain}, priority={self.priority}, host={self.host}, ttl={self.ttl})"
+
+
+class DnsRecordAAAA(DnsRecord):
+    def __init__(self, domain: str, addr: str, ttl: int):
+        self.domain = domain
+        self.addr = addr
+        self.ttl = ttl
+
+    def __repr__(self):
+        return f"DnsRecord.AAAA(domain={self.domain}, addr={self.addr}, ttl={self.ttl})"
 
 
 class DnsPacket:
@@ -468,7 +558,7 @@ class DnsPacket:
 
 
 def main():
-    qname = "google.com"
+    qname = "www.yahoo.com"
     qtype = QueryType.A
 
     server = ("8.8.8.8", 53)
