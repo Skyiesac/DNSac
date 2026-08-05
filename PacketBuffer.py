@@ -600,30 +600,38 @@ class DnsPacket:
 
 def lookup(qname: str, qtype: QueryType, server: tuple[str, int]) -> DnsPacket:
     """
-    Takes a domain name and query type, forwards it to Google's public DNS (8.8.8.8),
+    Takes a domain name and query type, forwards it to server,
     and returns the parsed DnsPacket response.
     """
-    server = ("8.8.8.8", 53)
+
 
     # Bind a UDP socket to an arbitrary port for outgoing queries
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", 43210))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(2.0)
 
-    packet = DnsPacket.new()
-    packet.header.id = 6666
-    packet.header.recursion_desired = True
-    packet.questions.append(DnsQuestion(qname, qtype))
-    req_buffer = BytePacketBuffer()
-    packet.write(req_buffer)
-    sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
+        packet = DnsPacket.new()
+        packet.header.id = random.randint(0, 65535)
+        packet.header.recursion_desired = True
+        packet.questions.append(DnsQuestion(qname, qtype))
+        req_buffer = BytePacketBuffer()
+        packet.write(req_buffer)
+        sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
 
-    #response
-    res_buffer = BytePacketBuffer()
-    raw_data, _ = sock.recvfrom(512)
-    
-    res_buffer.buf[:len(raw_data)] = raw_data
-    res_buffer.pos = 0
-    return DnsPacket.from_buffer(res_buffer)
+        #response
+        res_buffer = BytePacketBuffer()
+        try:
+            raw_data, _ = sock.recvfrom(512)
+        except socket.timeout:
+            raise TimeoutError("DNS upstream server timed out")
+
+        res_buffer.buf[:len(raw_data)] = raw_data
+        res_buffer.pos = 0
+
+        response = DnsPacket.from_buffer(res_buffer)
+        if response.header.id != packet.header.id:
+            raise ValueError("Transaction ID mismatch")
+
+        return response
 
 def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
     """
