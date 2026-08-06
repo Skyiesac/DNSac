@@ -3,6 +3,9 @@ import ipaddress
 import socket
 import random
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 class BufferError(Exception):
     """Custom exception raised when reading or seeking out of buffer bounds."""
@@ -598,6 +601,52 @@ class DnsPacket:
         return None
 
 
+_CACHE_LOCK = threading.Lock()
+_DNS_CACHE: dict[tuple[str, int], tuple[float, DnsPacket]] = {}
+ROOT_SERVERS = [
+    "198.41.0.4",      # a.root-servers.net
+    "199.9.14.201",    # b.root-servers.net
+    "192.33.4.12",     # c.root-servers.net
+    "199.7.91.13",     # d.root-servers.net
+]
+
+
+def _cache_key(qname: str, qtype: QueryType) -> tuple[str, int]:
+    return (qname.lower(), int(qtype))
+
+
+def _packet_ttl(packet: DnsPacket) -> int:
+    ttls = [
+        rec.ttl
+        for rec in (packet.answers + packet.authorities + packet.resources)
+        if hasattr(rec, "ttl") and rec.ttl > 0
+    ]
+    if not ttls:
+        return 30
+    return max(1, min(min(ttls), 3600))
+
+
+def _cache_get(qname: str, qtype: QueryType) -> DnsPacket | None:
+    key = _cache_key(qname, qtype)
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        item = _DNS_CACHE.get(key)
+        if item is None:
+            return None
+        expires_at, packet = item
+        if expires_at <= now:
+            del _DNS_CACHE[key]
+            return None
+        return packet
+
+
+def _cache_put(qname: str, qtype: QueryType, packet: DnsPacket) -> None:
+    ttl = _packet_ttl(packet)
+    key = _cache_key(qname, qtype)
+    with _CACHE_LOCK:
+        _DNS_CACHE[key] = (time.monotonic() + ttl, packet)
+
+
 def lookup(qname: str, qtype: QueryType, server: tuple[str, int]) -> DnsPacket:
     """
     Takes a domain name and query type, forwards it to server,
@@ -615,41 +664,60 @@ def lookup(qname: str, qtype: QueryType, server: tuple[str, int]) -> DnsPacket:
         packet.questions.append(DnsQuestion(qname, qtype))
         req_buffer = BytePacketBuffer()
         packet.write(req_buffer)
-        sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
+        for _ in range(3): #3 retries
+            sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
 
-        #response
-        res_buffer = BytePacketBuffer()
-        try:
-            raw_data, _ = sock.recvfrom(512)
-        except socket.timeout:
-            raise TimeoutError("DNS upstream server timed out")
+            #response
+            res_buffer = BytePacketBuffer()
+            try:
+                raw_data, _ = sock.recvfrom(512)
+            except socket.timeout:
+                continue
 
-        res_buffer.buf[:len(raw_data)] = raw_data
-        res_buffer.pos = 0
+            res_buffer.buf[:len(raw_data)] = raw_data
+            res_buffer.pos = 0
 
-        response = DnsPacket.from_buffer(res_buffer)
-        if response.header.id != packet.header.id:
-            raise ValueError("Transaction ID mismatch")
+            response = DnsPacket.from_buffer(res_buffer)
+            if response.header.id != packet.header.id:
+                continue
 
-        return response
+            return response
+
+        raise TimeoutError("DNS upstream server timed out")
 
 def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
     """
     Performs an iterative/recursive DNS lookup starting from the root servers,
     traversing TLDs and authoritative name servers until it resolves the query.
     """
-    # For now, always start with a root server (a.root-servers.net -> 198.41.0.4)
-    ns = "198.41.0.4"
+    cached = _cache_get(qname, qtype)
+    if cached is not None:
+        return cached
+
+    # Start from a root server and rotate if a root times out.
+    root_index = 0
+    ns = ROOT_SERVERS[root_index]
 
     while True:
         print(f"Attempting lookup of {qtype.name} {qname} with ns {ns}")
 
         server = (ns, 53)
-        response = lookup(qname, qtype, server)
+        try:
+            response = lookup(qname, qtype, server)
+        except TimeoutError:
+            if ns in ROOT_SERVERS:
+                root_index = (root_index + 1) % len(ROOT_SERVERS)
+                next_ns = ROOT_SERVERS[root_index]
+                if next_ns != ns:
+                    ns = next_ns
+                    continue
+            raise
 
         if response.answers and response.header.rescode == ResultCode.NOERROR:
+            _cache_put(qname, qtype, response)
             return response
         if response.header.rescode == ResultCode.NXDOMAIN:
+            _cache_put(qname, qtype, response)
             return response
         new_ns = response.get_resolved_ns(qname)
         if new_ns:
@@ -658,6 +726,7 @@ def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
 
         new_ns_name = response.get_unresolved_ns(qname)
         if not new_ns_name:
+            _cache_put(qname, qtype, response)
             return response
 
         #start another recursive lookup to find the IP of the name server
@@ -668,16 +737,15 @@ def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
         if random_ip:
             ns = random_ip
         else:
+            _cache_put(qname, qtype, response)
             return response
 
-def handle_query(sock: socket.socket) -> None:
+def handle_query(sock: socket.socket, raw_data: bytes, src: tuple[str, int]) -> None:
     """
     Handles a single incoming DNS query packet, uses recursive_lookup() to resolve it 
     from the root servers up, packs the response, and sends it back to the client.
     """
     req_buffer = BytePacketBuffer()
-    raw_data, src = sock.recvfrom(512)
-    
     req_buffer.buf[:len(raw_data)] = raw_data
     req_buffer.pos = 0
 
@@ -728,11 +796,14 @@ def main() -> None:
     server_sock.bind(("0.0.0.0", 2053))
     print("DNS Server running on port 2053...")
 
-    while True:
-        try:
-            handle_query(server_sock)
-        except Exception as e:
-            print(f"An error occurred: {e}", file=sys.stderr)
+    # Process packets in a small worker pool to handle concurrent clients.
+    with ThreadPoolExecutor(max_workers=64) as executor:
+        while True:
+            try:
+                raw_data, src = server_sock.recvfrom(512)
+                executor.submit(handle_query, server_sock, raw_data, src)
+            except Exception as e:
+                print(f"An error occurred: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
