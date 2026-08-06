@@ -42,9 +42,20 @@ class BytePacketBuffer:
     supporting DNS compression (label pointers/jumps).
     """
 
-    def __init__(self):
-        self.buf = bytearray(512)
+    def __init__(self, size: int = 512):
+        self.buf = bytearray(size)
         self.pos = 0
+        self.limit = 0
+
+    def set_data(self, data: bytes) -> None:
+        if len(data) > len(self.buf):
+            raise BufferError("Packet is too large")
+        self.buf[:len(data)] = data
+        self.limit = len(data)
+
+    def check_bounds(self, pos: int, length: int = 1) -> None:
+        if pos < 0 or length < 0 or pos + length > self.limit:
+            raise BufferError("Read outside packet bounds")
 
     def get_pos(self) -> int:
         """Current position within the buffer."""
@@ -60,7 +71,8 @@ class BytePacketBuffer:
 
     def read(self) -> int:
         """Read a single byte and move the position one step forward."""
-        if self.pos >= 512:
+        self.check_bounds(self.pos)
+        if self.pos >= len(self.buf):
             raise BufferError("End of buffer")
         res = self.buf[self.pos]
         self.pos += 1
@@ -68,13 +80,15 @@ class BytePacketBuffer:
 
     def get(self, pos: int) -> int:
         """Get a single byte without changing the buffer position."""
-        if pos >= 512:
+        self.check_bounds(pos)
+        if pos >= len(self.buf):
             raise BufferError("End of buffer")
         return self.buf[pos]
 
     def get_range(self, start: int, length: int) -> bytes:
         """Get a range of bytes without changing the buffer position."""
-        if start + length > 512:
+        self.check_bounds(start, length)
+        if start + length > len(self.buf):
             raise BufferError("End of buffer")
         return bytes(self.buf[start : start + length])
 
@@ -93,7 +107,7 @@ class BytePacketBuffer:
 
     def write(self, val: int) -> None:
         """Write a single byte and move the position one step forward."""
-        if self.pos >= 512:
+        if self.pos >= len(self.buf):
             raise BufferError("End of buffer")
         self.buf[self.pos] = val
         self.pos += 1
@@ -116,7 +130,7 @@ class BytePacketBuffer:
 
     def set(self, pos: int, val: int) -> None:
         """Set a single byte at a specific position without changing the buffer's read/write position."""
-        if pos >= 512:
+        if pos >= len(self.buf):
             raise BufferError("Position out of buffer bounds")
         self.buf[pos] = val
 
@@ -132,30 +146,36 @@ class BytePacketBuffer:
         """
         pos = self.get_pos()
         jumped = False
-        max_jumps = 5
-        jumps_performed = 0
+        visited = set()
 
         out_parts = []
+        total_length = 0
 
         while True:
-            if jumps_performed > max_jumps:
-                raise BufferError(f"Limit of {max_jumps} jumps exceeded")
+            if pos in visited:
+                raise BufferError("Compression pointer loop detected")
+            visited.add(pos)
+            if len(visited) > 20:
+                raise BufferError("Too many compression jumps")
 
             len_byte = self.get(pos)
 
             # Check if the two most significant bits are set 0xC0= 11000000
             #If they are 11, it means this is not a label length, it is a pointer
             if (len_byte & 0xC0) == 0xC0:
+                if (len_byte & 0xC0) == 0x80:
+                    raise BufferError("Invalid DNS label encoding")
                 # Update the main buffer position to right past the 2-byte jump pointer
                 if not jumped:
                     self.seek(pos + 2)
 
                 b2 = self.get(pos + 1)
                 offset = (((len_byte ^ 0xC0) << 8) | b2)
+                if offset >= self.limit:
+                    raise BufferError("Compression pointer outside packet bounds")
                 pos = offset
 
                 jumped = True
-                jumps_performed += 1
                 continue
 
             else:
@@ -164,6 +184,13 @@ class BytePacketBuffer:
                 # Length of 0 signals the end of the qname
                 if len_byte == 0:
                     break
+
+                if len_byte > 63:
+                    raise BufferError("Label exceeds 63 bytes")
+
+                total_length += len_byte + 1
+                if total_length > 255:
+                    raise BufferError("Domain name exceeds 255 bytes")
 
                 str_buffer = self.get_range(pos, len_byte)
                 # Decode as UTF-8/ASCII safely and convert to lowercase
@@ -285,9 +312,13 @@ class QueryType(IntEnum):
     A = 1
     NS = 2
     CNAME = 5
+    SOA = 6
     MX = 15
     TXT = 16
     AAAA = 28
+    SVCB = 64
+    HTTPS = 65
+    DNSKEY = 48
     
     @classmethod
     def from_num(cls, num: int) -> "QueryType":
@@ -301,19 +332,21 @@ class QueryType(IntEnum):
             return cls.UNKNOWN
 
 class DnsQuestion(ReprMixin):
-    def __init__(self, name: str = "", qtype: QueryType = QueryType.A):
+    def __init__(self, name: str = "", qtype_num: int = 1, qclass: int = 1):
         self.name: str = name
-        self.qtype: QueryType = qtype
+        self.qtype_num = qtype_num
+        self.qclass = qclass
+
+    @property
+    def qtype(self) -> QueryType:
+        return QueryType.from_num(self.qtype_num)
 
     @classmethod
     def read(cls, buffer: BytePacketBuffer) -> "DnsQuestion":
         question = cls()
         question.name = buffer.read_qname()
-        qtype_num = buffer.read_u16()
-        question.qtype = QueryType.from_num(qtype_num)
-        
-        # Ignore the class field
-        _ = buffer.read_u16()
+        question.qtype_num = buffer.read_u16()
+        question.qclass = buffer.read_u16()
 
         return question
 
@@ -323,12 +356,8 @@ class DnsQuestion(ReprMixin):
         """
         buffer.write_qname(self.name)
 
-        # qtype is an IntEnum, we can use int(self.qtype) directly,
-        typenum = int(self.qtype)
-        buffer.write_u16(typenum)
-
-        #the query class (1 for Internet, standard for almost all DNS queries)
-        buffer.write_u16(1)
+        buffer.write_u16(self.qtype_num)
+        buffer.write_u16(self.qclass)
 
 class DnsRecord:
     """Base class for parsed DNS records (Answers, Authorities, Additional records)."""
@@ -344,11 +373,13 @@ class DnsRecord:
         qtype_num = buffer.read_u16()
         qtype = QueryType.from_num(qtype_num)
         
-        _ = buffer.read_u16()  # Class (usually 1 for IN)
+        record_class = buffer.read_u16()  # Class (for OPT, this is UDP payload size)
         ttl = buffer.read_u32()
         data_len = buffer.read_u16()
 
         if qtype == QueryType.A:
+            if data_len != 4:
+                raise BufferError("Invalid A record length")
             raw_addr = buffer.read_u32()
             
             # Convert 32-bit raw integer into a readable IP address string (e.g., '192.168.1.1')
@@ -356,32 +387,46 @@ class DnsRecord:
             return DnsRecordA(domain=domain, addr=addr, ttl=ttl)
 
         elif qtype == QueryType.NS:
+            rdata_start = buffer.get_pos()
             host = buffer.read_qname()
+            if buffer.get_pos() - rdata_start != data_len:
+                raise BufferError("Record length mismatch")
             return DnsRecordNS(domain=domain, host=host, ttl=ttl)
 
         elif qtype == QueryType.CNAME:
+            rdata_start = buffer.get_pos()
             host = buffer.read_qname()
+            if buffer.get_pos() - rdata_start != data_len:
+                raise BufferError("Record length mismatch")
             return DnsRecordCNAME(domain=domain, host=host, ttl=ttl)
 
         elif qtype == QueryType.MX:
+            rdata_start = buffer.get_pos()
             priority = buffer.read_u16()
             host = buffer.read_qname()
+            if buffer.get_pos() - rdata_start != data_len:
+                raise BufferError("Record length mismatch")
             return DnsRecordMX(domain=domain, priority=priority, host=host, ttl=ttl)
 
         elif qtype == QueryType.AAAA:
             # Read 16 bytes for IPv6 address
+            if data_len != 16:
+                raise BufferError("Invalid AAAA record length")
             raw_bytes = buffer.get_range(buffer.get_pos(), 16)
             buffer.step(16)
             addr = str(ipaddress.ip_address(raw_bytes))
             return DnsRecordAAAA(domain=domain, addr=addr, ttl=ttl)
         
         else:
+            raw_rdata = buffer.get_range(buffer.get_pos(), data_len)
             buffer.step(data_len)
             return DnsRecordUnknown(
                 domain=domain, 
                 qtype=qtype_num, 
+                record_class=record_class,
                 data_len=data_len, 
-                ttl=ttl
+                ttl=ttl,
+                rdata=raw_rdata,
             )
 
     def write(self, buffer: BytePacketBuffer) -> int:
@@ -429,16 +474,24 @@ class DnsRecord:
                 buffer.write_u16((ip_obj.packed[i] << 8) | ip_obj.packed[i + 1])
 
         elif isinstance(self, DnsRecordUnknown):
-            print(f"Skipping record: {self!r}")
+            buffer.write_qname(self.domain)
+            buffer.write_u16(self.qtype)
+            buffer.write_u16(self.record_class)
+            buffer.write_u32(self.ttl)
+            buffer.write_u16(len(self.rdata))
+            for b in self.rdata:
+                buffer.write_u8(b)
             
         return buffer.get_pos() - start_pos
 
 class DnsRecordUnknown(DnsRecord):
-    def __init__(self, domain: str, qtype: int, data_len: int, ttl: int):
+    def __init__(self, domain: str, qtype: int, record_class: int, data_len: int, ttl: int, rdata: bytes = b""):
         self.domain = domain
         self.qtype = qtype
+        self.record_class = record_class
         self.data_len = data_len
         self.ttl = ttl
+        self.rdata = rdata
 
     def __repr__(self):
         return f"DnsRecord.UNKNOWN(domain={self.domain}, qtype={self.qtype}, data_len={self.data_len}, ttl={self.ttl})"
@@ -575,10 +628,20 @@ class DnsPacket:
         Helper generator yielding (domain, host) tuples from the authorities section
         that are authoritative for the given query name.
         """
+        qname = qname.rstrip(".").lower()
+        best_match = []
+        best_len = -1
         for record in self.authorities:
             if isinstance(record, DnsRecordNS):
-                if qname.endswith(record.domain):
-                    yield (record.domain, record.host)
+                domain = record.domain.rstrip(".").lower()
+                if qname == domain or qname.endswith("." + domain):
+                    if len(domain) > best_len:
+                        best_match = [(record.domain, record.host)]
+                        best_len = len(domain)
+                    elif len(domain) == best_len:
+                        best_match.append((record.domain, record.host))
+        for item in best_match:
+            yield item
 
     def get_resolved_ns(self, qname: str) -> str | None:
         """
@@ -588,6 +651,8 @@ class DnsPacket:
         for _, host in self._get_ns(qname):
             for record in self.resources:
                 if isinstance(record, DnsRecordA) and record.domain == host:
+                    return record.addr
+                if isinstance(record, DnsRecordAAAA) and record.domain == host:
                     return record.addr
         return None
 
@@ -602,7 +667,7 @@ class DnsPacket:
 
 
 _CACHE_LOCK = threading.Lock()
-_DNS_CACHE: dict[tuple[str, int], tuple[float, DnsPacket]] = {}
+_DNS_CACHE: dict[tuple[str, int, int], tuple[float, DnsPacket, float]] = {}
 ROOT_SERVERS = [
     "198.41.0.4",      # a.root-servers.net
     "199.9.14.201",    # b.root-servers.net
@@ -611,8 +676,8 @@ ROOT_SERVERS = [
 ]
 
 
-def _cache_key(qname: str, qtype: QueryType) -> tuple[str, int]:
-    return (qname.lower(), int(qtype))
+def _cache_key(qname: str, qtype: QueryType, qclass: int = 1) -> tuple[str, int, int]:
+    return (qname.lower(), int(qtype), qclass)
 
 
 def _packet_ttl(packet: DnsPacket) -> int:
@@ -626,25 +691,101 @@ def _packet_ttl(packet: DnsPacket) -> int:
     return max(1, min(min(ttls), 3600))
 
 
-def _cache_get(qname: str, qtype: QueryType) -> DnsPacket | None:
-    key = _cache_key(qname, qtype)
+def _clone_record_with_ttl(record, ttl: int):
+    if isinstance(record, DnsRecordA):
+        return DnsRecordA(record.domain, record.addr, ttl)
+    if isinstance(record, DnsRecordAAAA):
+        return DnsRecordAAAA(record.domain, record.addr, ttl)
+    if isinstance(record, DnsRecordNS):
+        return DnsRecordNS(record.domain, record.host, ttl)
+    if isinstance(record, DnsRecordCNAME):
+        return DnsRecordCNAME(record.domain, record.host, ttl)
+    if isinstance(record, DnsRecordMX):
+        return DnsRecordMX(record.domain, record.priority, record.host, ttl)
+    if isinstance(record, DnsRecordUnknown):
+        return DnsRecordUnknown(record.domain, record.qtype, record.record_class, record.data_len, ttl, record.rdata)
+    return record
+
+
+def _clone_cached_packet(packet: DnsPacket, remaining_ttl: int) -> DnsPacket:
+    cloned = DnsPacket.new()
+    cloned.header = packet.header
+    cloned.questions = list(packet.questions)
+    cloned.answers = [_clone_record_with_ttl(rec, remaining_ttl) for rec in packet.answers]
+    cloned.authorities = [_clone_record_with_ttl(rec, remaining_ttl) for rec in packet.authorities]
+    cloned.resources = [_clone_record_with_ttl(rec, remaining_ttl) for rec in packet.resources]
+    return cloned
+
+
+def _cache_get(qname: str, qtype: QueryType, qclass: int = 1) -> DnsPacket | None:
+    key = _cache_key(qname, qtype, qclass)
     now = time.monotonic()
     with _CACHE_LOCK:
         item = _DNS_CACHE.get(key)
         if item is None:
             return None
-        expires_at, packet = item
+        expires_at, packet, created_at = item
         if expires_at <= now:
             del _DNS_CACHE[key]
             return None
-        return packet
+        remaining = max(1, int(expires_at - now))
+        return _clone_cached_packet(packet, remaining)
 
 
-def _cache_put(qname: str, qtype: QueryType, packet: DnsPacket) -> None:
+def _cache_put(qname: str, qtype: QueryType, packet: DnsPacket, qclass: int = 1) -> None:
     ttl = _packet_ttl(packet)
-    key = _cache_key(qname, qtype)
+    key = _cache_key(qname, qtype, qclass)
     with _CACHE_LOCK:
-        _DNS_CACHE[key] = (time.monotonic() + ttl, packet)
+        now = time.monotonic()
+        _DNS_CACHE[key] = (now + ttl, packet, now)
+
+
+def _append_edns0(buffer: BytePacketBuffer) -> None:
+    # Minimal EDNS0 OPT record with the DNSSEC OK (DO) bit set.
+    buffer.set_u16(10, 1)   # additional record count
+    buffer.write_u8(0)      # root name
+    buffer.write_u16(41)    # OPT
+    buffer.write_u16(1232)  # advertised UDP payload size
+    buffer.write_u32(0x8000)  # DO bit
+    buffer.write_u16(0)     # no OPT payload
+
+
+def _is_opt_record(record) -> bool:
+    return isinstance(record, DnsRecordUnknown) and record.qtype == 41
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("Unexpected EOF from DNS TCP upstream")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _server_socket_family(host: str) -> int:
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
+def _lookup_tcp(server: tuple[str, int], query_data: bytes, expected_id: int) -> DnsPacket:
+    family = _server_socket_family(server[0])
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.settimeout(4.0)
+        sock.connect(server if family == socket.AF_INET else (server[0], server[1], 0, 0))
+        sock.sendall(len(query_data).to_bytes(2, "big") + query_data)
+
+        msg_len = int.from_bytes(_recv_exact(sock, 2), "big")
+        raw_data = _recv_exact(sock, msg_len)
+
+    res_buffer = BytePacketBuffer(max(4096, len(raw_data)))
+    res_buffer.set_data(raw_data)
+    res_buffer.pos = 0
+
+    response = DnsPacket.from_buffer(res_buffer)
+    if response.header.id != expected_id:
+        raise ValueError("Transaction ID mismatch")
+    return response
 
 
 def lookup(qname: str, qtype: QueryType, server: tuple[str, int]) -> DnsPacket:
@@ -655,41 +796,70 @@ def lookup(qname: str, qtype: QueryType, server: tuple[str, int]) -> DnsPacket:
 
 
     # Bind a UDP socket to an arbitrary port for outgoing queries
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    family = _server_socket_family(server[0])
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
         sock.settimeout(2.0)
 
         packet = DnsPacket.new()
         packet.header.id = random.randint(0, 65535)
-        packet.header.recursion_desired = True
+        packet.header.recursion_desired = False
         packet.questions.append(DnsQuestion(qname, qtype))
         req_buffer = BytePacketBuffer()
         packet.write(req_buffer)
+        _append_edns0(req_buffer)
+        request_data = bytes(req_buffer.buf[:req_buffer.pos])
+
         for _ in range(3): #3 retries
-            sock.sendto(bytes(req_buffer.buf[:req_buffer.pos]), server)
+            sock.sendto(request_data, server if family == socket.AF_INET else (server[0], server[1], 0, 0))
 
             #response
-            res_buffer = BytePacketBuffer()
+            res_buffer = BytePacketBuffer(4096)
             try:
-                raw_data, _ = sock.recvfrom(512)
+                raw_data, _ = sock.recvfrom(4096)
             except socket.timeout:
                 continue
 
-            res_buffer.buf[:len(raw_data)] = raw_data
+            res_buffer.set_data(raw_data)
             res_buffer.pos = 0
 
             response = DnsPacket.from_buffer(res_buffer)
             if response.header.id != packet.header.id:
                 continue
 
+            if response.header.truncated_message:
+                return _lookup_tcp(server, request_data, packet.header.id)
+
             return response
 
         raise TimeoutError("DNS upstream server timed out")
 
-def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
+def recursive_lookup(
+    qname: str,
+    qtype: QueryType,
+    depth: int = 0,
+    visited: set[tuple[str, int]] | None = None,
+    deadline: float | None = None,
+) -> DnsPacket:
     """
     Performs an iterative/recursive DNS lookup starting from the root servers,
     traversing TLDs and authoritative name servers until it resolves the query.
     """
+    if depth > 20:
+        raise RuntimeError("Maximum DNS recursion depth exceeded")
+
+    if deadline is None:
+        deadline = time.monotonic() + 10.0
+    if time.monotonic() > deadline:
+        raise TimeoutError("DNS resolution deadline exceeded")
+
+    if visited is None:
+        visited = set()
+
+    key = (qname.rstrip(".").lower(), int(qtype))
+    if key in visited:
+        raise RuntimeError("DNS resolution loop detected")
+    visited.add(key)
+
     cached = _cache_get(qname, qtype)
     if cached is not None:
         return cached
@@ -730,10 +900,12 @@ def recursive_lookup(qname: str, qtype: QueryType) -> DnsPacket:
             return response
 
         #start another recursive lookup to find the IP of the name server
-        recursive_response = recursive_lookup(new_ns_name, QueryType.A)
+        recursive_response = recursive_lookup(new_ns_name, QueryType.A, depth + 1, visited, deadline)
 
         # Pick a random IP from the result, and restart the loop
         random_ip = recursive_response.get_random_a()
+        if not random_ip:
+            random_ip = recursive_response.get_random_aaaa()
         if random_ip:
             ns = random_ip
         else:
@@ -745,11 +917,31 @@ def handle_query(sock: socket.socket, raw_data: bytes, src: tuple[str, int]) -> 
     Handles a single incoming DNS query packet, uses recursive_lookup() to resolve it 
     from the root servers up, packs the response, and sends it back to the client.
     """
-    req_buffer = BytePacketBuffer()
-    req_buffer.buf[:len(raw_data)] = raw_data
+    req_buffer = BytePacketBuffer(4096)
+    req_buffer.set_data(raw_data)
     req_buffer.pos = 0
 
     request = DnsPacket.from_buffer(req_buffer)
+    if request.header.response or request.header.opcode != 0:
+        packet = DnsPacket.new()
+        packet.header.id = request.header.id
+        packet.header.response = True
+        packet.header.rescode = ResultCode.NOTIMP
+        res_buffer = BytePacketBuffer(512)
+        packet.write(res_buffer)
+        sock.sendto(bytes(res_buffer.buf[:res_buffer.pos]), src)
+        return
+
+    if not request.questions or len(request.questions) != 1 or request.questions[0].qclass != 1:
+        packet = DnsPacket.new()
+        packet.header.id = request.header.id
+        packet.header.response = True
+        packet.header.rescode = ResultCode.FORMERR
+        res_buffer = BytePacketBuffer(512)
+        packet.write(res_buffer)
+        sock.sendto(bytes(res_buffer.buf[:res_buffer.pos]), src)
+        return
+
     packet = DnsPacket.new()
     packet.header.id = request.header.id
     packet.header.recursion_desired = True
@@ -772,6 +964,8 @@ def handle_query(sock: socket.socket, raw_data: bytes, src: tuple[str, int]) -> 
                 print(f"Authority: {rec!r}")
                 packet.authorities.append(rec)
             for rec in result.resources:
+                if _is_opt_record(rec):
+                    continue
                 print(f"Resource: {rec!r}")
                 packet.resources.append(rec)
         except Exception as e:
@@ -780,7 +974,7 @@ def handle_query(sock: socket.socket, raw_data: bytes, src: tuple[str, int]) -> 
     else:
         packet.header.rescode = ResultCode.FORMERR
 
-    res_buffer = BytePacketBuffer()
+    res_buffer = BytePacketBuffer(4096)
     packet.write(res_buffer)
     
     response_data = bytes(res_buffer.buf[:res_buffer.pos])
@@ -790,17 +984,17 @@ def handle_query(sock: socket.socket, raw_data: bytes, src: tuple[str, int]) -> 
 def main() -> None:
     """
     Binds the local DNS server to port 2053 and runs an infinite loop 
-    servicing incoming requests sequentially.
+    servicing incoming requests concurrently.
     """
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server_sock.bind(("0.0.0.0", 2053))
+    server_sock.bind(("127.0.0.1", 2053))
     print("DNS Server running on port 2053...")
 
     # Process packets in a small worker pool to handle concurrent clients.
     with ThreadPoolExecutor(max_workers=64) as executor:
         while True:
             try:
-                raw_data, src = server_sock.recvfrom(512)
+                raw_data, src = server_sock.recvfrom(4096)
                 executor.submit(handle_query, server_sock, raw_data, src)
             except Exception as e:
                 print(f"An error occurred: {e}", file=sys.stderr)
